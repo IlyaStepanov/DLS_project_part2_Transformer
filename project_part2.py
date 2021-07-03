@@ -26,7 +26,7 @@ def attention(query, key, value, mask=None, dropout=None):
 
 
 class MultiHeadedAttention(nn.Module):
-    def __init__(self, h, d_model, dropout=0.1):
+    def __init__(self, h, d_model, dropout=0.1, pruning=False):
         "Take in model size and number of heads."
         super(MultiHeadedAttention, self).__init__()
         assert d_model % h == 0
@@ -36,7 +36,15 @@ class MultiHeadedAttention(nn.Module):
         self.linears = clones(nn.Linear(d_model, d_model), 4)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
-        
+        self.pruning = pruning
+
+        if pruning:
+            # self.log_a = nn.Parameter(torch.rand(h))
+            self.log_a = nn.Parameter(torch.ones(h))
+            self.gate = ConcreteGate(self.log_a)
+            # self.L0 = torch.tensor(0.0)
+            self.register_buffer('L1', torch.tensor(3))
+
     def forward(self, query, key, value, mask=None):
         "Implements Figure 2"
         if mask is not None:
@@ -55,6 +63,13 @@ class MultiHeadedAttention(nn.Module):
 
         
         # here we will need to multiply by binary concrete distribution
+        if self.pruning:
+            x = x.transpose(-1, 1)
+            x = self.gate(x, is_train=self.training)
+            self.L0 = nn.Parameter(self.gate.get_penalty(values=x), requires_grad=True)
+            # self.register_buffer('L0',self.gate.get_penalty(values=x))
+            x = x.transpose(-1, 1)
+            
 
         
         # 3) "Concat" using a view and apply a final linear. 
@@ -232,10 +247,12 @@ class Embeddings(nn.Module):
 
 
 def make_model(src_vocab, tgt_vocab, N=6, 
-               d_model=512, d_ff=2048, h=8, dropout=0.1):
+               d_model=512, d_ff=2048, h=8, dropout=0.1, pruning=False):
     "Helper: Construct a model from hyperparameters."
+
     c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
+
+    attn = MultiHeadedAttention(h, d_model, pruning=pruning)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
     model = EncoderDecoder(
@@ -258,30 +275,42 @@ def make_model(src_vocab, tgt_vocab, N=6,
 # https://github.com/lena-voita/the-story-of-heads/blob/126c277144913ff31e6bbd7b8c24dc005b9c2805/lib/layers/concrete_gate.py#L47
 class ConcreteGate():
 
-    def __init__(self, temperature=0.33, stretch_limits=(-0.1, 1.1), eps=1e-6):
+    def __init__(self, log_a, temperature=0.33, stretch_limits=(-0.1, 1.1), eps=1e-6):
         self.temperature, self.stretch_limits, self.eps = temperature, stretch_limits, eps
+        self.log_a = log_a
 
-    # def __call__(self, values, is_train=None, axis=None, reg_collection=tf.GraphKeys.REGULARIZATION_LOSSES):
-    #     """ applies gate to values, if is_train, adds regularizer to reg_collection """
-    #     is_train = lib.layers.basic.is_dropout_enabled() if is_train is None else is_train
-    #     gates = self.get_gates(is_train, shape=tf.shape(values) if self.local_rep else None)
-
-    #     if self.l0_penalty != 0 or self.l2_penalty != 0:
-    #         reg = self.get_penalty(values=values, axis=axis)
-    #         tf.add_to_collection(reg_collection, tf.identity(reg, name='concrete_gate_reg'))
-    #     return values * gates
+    def __call__(self, values, is_train=True):
+        """ applies gate to values, if is_train, adds regularizer to reg_collection """
+        gates = self.get_gates(is_train) 
+        return values * gates
           
     def get_gates(self, is_train, shape=None):
             """ samples gate activations in [0, 1] interval """
             low, high = self.stretch_limits
             if is_train:
-                # shape = tf.shape(self.log_a) if shape is None else shape
-                noise = (1.0 - self.eps - self.eps) * torch.rand(self.shape) + self.eps
-                concrete = F.sigmoid((torch.log(noise) - torch.log(1 - noise) + self.log_a) / self.temperature)
+                shape = self.log_a.shape if shape is None else shape
+                noise = (1.0 - self.eps - self.eps) * torch.rand(shape) + self.eps
+                noise = noise.to(self.log_a.device)
+                concrete = torch.sigmoid((torch.log(noise) - torch.log(1 - noise) + self.log_a) / self.temperature)
             else:
-                concrete = F.sigmoid(self.log_a)
+                concrete = torch.sigmoid(self.log_a)
 
             stretched_concrete = concrete * (high - low) + low
             clipped_concrete = torch.clamp(stretched_concrete, 0, 1)
 
             return clipped_concrete
+
+    def get_penalty(self, values):
+        low, high = self.stretch_limits
+        
+        p_open = torch.sigmoid(self.log_a - self.temperature * torch.log(torch.tensor(-low / high)))
+        p_open = torch.clamp(p_open, self.eps, 1.0 - self.eps)
+
+        total_reg = 0.0
+
+        p_open = torch.add(p_open, torch.zeros_like(values)) # broadcast shape to account for values
+
+        total_reg = torch.mean(p_open, [0, 2]) # need to average by batch! shape of p_open: [batch, d_k, sent_len, head]
+        total_reg = torch.sum(total_reg) 
+
+        return total_reg
