@@ -37,10 +37,11 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
         self.pruning = pruning
+        self.L0 = 0
 
         if pruning:
             # self.log_a = nn.Parameter(torch.rand(h))
-            self.log_a = nn.Parameter(torch.ones(h))
+            self.log_a = nn.Parameter(torch.ones(h) * (-1))
             self.gate = ConcreteGate(self.log_a)
             # self.L0 = torch.tensor(0.0)
             self.register_buffer('L1', torch.tensor(3))
@@ -66,8 +67,9 @@ class MultiHeadedAttention(nn.Module):
         if self.pruning:
             x = x.transpose(-1, 1)
             x = self.gate(x, is_train=self.training)
-            self.L0 = nn.Parameter(self.gate.get_penalty(values=x), requires_grad=True)
+            # self.L0 = nn.Parameter(self.gate.get_penalty(values=x), requires_grad=True)
             # self.register_buffer('L0',self.gate.get_penalty(values=x))
+            self.L0 = self.gate.get_penalty(values=x)
             x = x.transpose(-1, 1)
             
 
@@ -275,9 +277,10 @@ def make_model(src_vocab, tgt_vocab, N=6,
 # https://github.com/lena-voita/the-story-of-heads/blob/126c277144913ff31e6bbd7b8c24dc005b9c2805/lib/layers/concrete_gate.py#L47
 class ConcreteGate():
 
-    def __init__(self, log_a, temperature=0.33, stretch_limits=(-0.1, 1.1), eps=1e-6):
+    def __init__(self, log_a, temperature=0.1, stretch_limits=(-0.1, 1.1), eps=1e-6):
         self.temperature, self.stretch_limits, self.eps = temperature, stretch_limits, eps
         self.log_a = log_a
+        self.hard = True
 
     def __call__(self, values, is_train=True):
         """ applies gate to values, if is_train, adds regularizer to reg_collection """
@@ -298,6 +301,10 @@ class ConcreteGate():
             stretched_concrete = concrete * (high - low) + low
             clipped_concrete = torch.clamp(stretched_concrete, 0, 1)
 
+            if self.hard:
+                hard_concrete = (torch.greater(clipped_concrete, 0.5)).float()
+                clipped_concrete = clipped_concrete + (hard_concrete - clipped_concrete).detach()
+
             return clipped_concrete
 
     def get_penalty(self, values):
@@ -311,6 +318,7 @@ class ConcreteGate():
         p_open = torch.add(p_open, torch.zeros_like(values)) # broadcast shape to account for values
 
         total_reg = torch.mean(p_open, [0, 2]) # need to average by batch! shape of p_open: [batch, d_k, sent_len, head]
-        total_reg = torch.sum(total_reg) 
+        total_reg = torch.sum(total_reg)
+        # total_reg = torch.mean(p_open) 
 
         return total_reg
